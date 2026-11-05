@@ -1,13 +1,19 @@
 // Emochi - emoji ala Dasai Mochi untuk LilyGo T-Display (ESP32, 240x135)
 // Port dari emochi_final2.js (Bruce JS) + ekspresi tambahan
-// Tombol: GPIO35 = colek (1-2x bingung, 3-4x marah, 5x+ pusing) | GPIO0 = ganti mood manual
+// Tombol atas (GPIO35): klik = info baterai | dobel klik = power off | klik lagi = nyala
+// Tombol bawah (GPIO0): klik = colek (1-2x bingung/senang, 3-4x marah, 5x+ pusing) | tahan = ganti mood
 
 #include <Arduino.h>
 #include <TFT_eSPI.h>
 #include <math.h>
+#include <string.h>
+#include <stdio.h>
+#include <esp_sleep.h>
 
-#define BTN_POKE 35
-#define BTN_MOOD 0
+#define BTN_POWER 35   // tombol atas
+#define BTN_POKE  0    // tombol bawah
+#define BAT_PIN   34   // ADC baterai (pembagi 2:1)
+#define BAT_EN    14   // enable pengukuran baterai (diabaikan kalau tidak terpasang di board)
 #define ROTATION 1   // ubah ke 3 kalau tampilan terbalik
 
 TFT_eSPI tft;
@@ -20,7 +26,7 @@ const uint16_t FG = TFT_WHITE;
 // 0 normal | 1 melirik | 4 ngantuk | 5 sedih | 7 curiga | 9 tidur | 10 marah | 11 ketawa
 // 12 jatuh cinta | 13 kedip sebelah | 14 nangis | 15 pusing | 16 bosan | 17 malu
 // 18 mata bintang | 19 mati (X_X) | 20 takut | 21 mikir | 22 smirk | 23 tenang | 24 cium | 25 berbinar
-// 26 bingung (reaksi colek 1-2x)
+// 26 bingung (reaksi colek 1-2x) | 27 lemas (baterai hampir habis)
 
 const int NUM_MOODS = 6;
 const int POOL_SIZE = 8;
@@ -42,14 +48,30 @@ int emojiState = 0, stateTimer = 0, loopCounter = 0;
 int sineIndex = 0, floatingY = 0, baseEyeY = 0, mouthY = 0;
 int lookDir = 0;
 int currentMood = 0, moodTimer = 0;
-const int moodDuration = 500;
 int blinkPhase = 0, blinkTimer = 0;
 const int blinkCooldown = 80;
 int reactionTimer = 0, pressCount = 0, pressDecay = 0;
 int zOffset = 0, zCounter = 0;
 
-bool prevPoke = true, prevMood = true;
 uint32_t lastFrame = 0;
+
+// interaksi ala pet: perhatian 0..100, turun pelan, naik saat dicolek
+int attention = 75, attnTimer = 0, moodHold = 0;
+
+// tombol
+bool prevTop = true, prevBot = true;
+uint32_t lastTopPress = 0, botDownAt = 0;
+bool haveTop = false, longDone = false;
+
+// baterai
+int vbat = 0, battPct = 0, critCount = 0;
+bool battValid = false, lowBattery = false, battShowOn = false;
+uint32_t battShowUntil = 0;
+
+// transisi antar ekspresi (wajah menciut ke garis mata lalu membuka lagi)
+bool trans = false;
+int transFrame = 0, pendingState = 0;
+const uint8_t TRANS_PCT[5] = {75, 45, 20, 45, 75};
 
 // ================= helper gambar =================
 
@@ -177,7 +199,7 @@ static bool canBlink(int s) {
 
 // ================= render =================
 
-void render() {
+static void drawFace() {
   spr.fillSprite(BG);
   int by = baseEyeY, my = mouthY;
   int cx = centerX, L = eyeL_X, R = eyeR_X;
@@ -403,14 +425,163 @@ void render() {
       smile(cx, my - 8, 10, 4);
       break;
     }
+
+    case 27: {                                // lemas (baterai hampir habis)
+      int w = (loopCounter % 6 < 3) ? 0 : 1;
+      spr.fillCircle(L, by + 14, 17, FG);
+      spr.fillRect(L - 18, by - 4, 36, 18, BG);
+      spr.fillCircle(R, by + 14, 17, FG);
+      spr.fillRect(R - 18, by - 4, 36, 18, BG);
+      arch(cx, my + 12 + w, 10, 4);
+      break;
+    }
   }
 
+}
+
+// persempit wajah secara vertikal terhadap baris c (in-place, tanpa RAM tambahan)
+static void squashRows(int c, int pct) {
+  uint16_t* b = (uint16_t*)spr.getPointer();
+  if (!b || pct >= 100) return;
+  for (int d = 0; d <= c; d++) {            // bagian atas
+    int dst = c - d, src = c - (d * 100) / pct;
+    uint16_t* dp = b + dst * W;
+    if (src < 0) memset(dp, 0, W * 2);
+    else if (src != dst) memcpy(dp, b + src * W, W * 2);
+  }
+  for (int d = 1; c + d < H; d++) {         // bagian bawah
+    int dst = c + d, src = c + (d * 100) / pct;
+    uint16_t* dp = b + dst * W;
+    if (src >= H) memset(dp, 0, W * 2);
+    else memcpy(dp, b + src * W, W * 2);
+  }
+}
+
+static void drawBatteryOverlay(bool withText) {
+  int x = W - 40, y = 5;
+  spr.fillRect(x, y, 30, 14, FG);
+  spr.fillRect(x + 2, y + 2, 26, 10, BG);
+  spr.fillRect(x + 30, y + 4, 3, 6, FG);
+  int w = battValid ? (24 * battPct) / 100 : 0;
+  if (w > 0) spr.fillRect(x + 3, y + 3, w, 8, FG);
+  if (withText) {
+    char b[8];
+    if (battValid) snprintf(b, sizeof b, "%d%%", battPct);
+    else snprintf(b, sizeof b, "--");
+    spr.setTextColor(FG, BG);
+    spr.setTextSize(2);
+    spr.drawString(b, x - 4 - (int)strlen(b) * 12, y - 1, 1);
+  }
+}
+
+void render(int pct) {
+  drawFace();
+  if (pct < 100) squashRows(baseEyeY, pct);
+  if (battShowOn) drawBatteryOverlay(true);
+  else if (lowBattery && (loopCounter / 12) % 2 == 0) drawBatteryOverlay(false);
   spr.pushSprite(0, 0);
 }
 
+// ================= baterai =================
+
+static int pctFromMv(int mv) {
+  static const int T[9][2] = {{3300, 0}, {3500, 5}, {3600, 15}, {3700, 35}, {3800, 55},
+                              {3900, 70}, {4000, 82}, {4100, 92}, {4200, 100}};
+  if (mv <= T[0][0]) return 0;
+  if (mv >= T[8][0]) return 100;
+  for (int i = 1; i < 9; i++) {
+    if (mv <= T[i][0]) {
+      return T[i - 1][1] + (T[i][1] - T[i - 1][1]) * (mv - T[i - 1][0]) / (T[i][0] - T[i - 1][0]);
+    }
+  }
+  return 100;
+}
+
+static void readBattery(bool first) {
+  digitalWrite(BAT_EN, HIGH);
+  delay(3);
+  uint32_t sum = 0;
+  for (int i = 0; i < 8; i++) { sum += analogReadMilliVolts(BAT_PIN); delay(1); }
+  digitalWrite(BAT_EN, LOW);
+  int mv = (int)(sum / 8) * 2;
+  battValid = mv > 2800;                    // di bawah itu: tanpa baterai / tidak terbaca
+  if (!battValid) { lowBattery = false; critCount = 0; return; }
+  vbat = (first || vbat == 0) ? mv : (vbat * 7 + mv * 3) / 10;
+  battPct = pctFromMv(vbat);
+  if (!lowBattery && vbat < 3500) lowBattery = true;
+  else if (lowBattery && vbat > 3600) lowBattery = false;
+  if (vbat < 3300) critCount++; else critCount = 0;
+}
+
+// ================= power =================
+
+static void powerOff() {
+  // animasi tidur singkat
+  emojiState = 9;
+  blinkPhase = 0;
+  battShowOn = false;
+  for (int i = 0; i < 22; i++) {
+    zOffset = (zOffset + 1) % 28;
+    loopCounter++;
+    render(100);
+    delay(40);
+  }
+  while (digitalRead(BTN_POWER) == LOW) delay(10);   // tunggu tombol dilepas
+  delay(80);
+  digitalWrite(TFT_BL, LOW);
+  tft.writecommand(TFT_DISPOFF);
+  tft.writecommand(TFT_SLPIN);
+  delay(120);
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_35, 0);      // klik tombol atas = nyala
+  esp_deep_sleep_start();
+}
+
+// ================= logika =================
+
+static void changeState(int s) {
+  if (trans && transFrame <= 2) { pendingState = s; return; }  // belum sempat ganti: ubah tujuan
+  if (s == emojiState) return;
+  pendingState = s;
+  trans = true;
+  transFrame = 0;
+}
+
+static void go(int s, int react) {
+  reactionTimer = react;
+  stateTimer = 0;
+  changeState(s);
+}
+
+static int moodFromAttention() {
+  if (attention >= 70) return random(0, 2) ? 1 : 4;
+  if (attention >= 40) return 0;
+  if (attention >= 20) return 3;
+  if (attention >= 8) return 5;
+  return 2;
+}
+
+static void doPoke() {
+  pressCount++;
+  pressDecay = 60;
+  bool lonely = attention < 25;
+  if (pressCount <= 2) {
+    attention += lonely ? 25 : 8;
+    if (attention > 100) attention = 100;
+  }
+  if (pressCount >= 5)      go(15, 80);
+  else if (pressCount >= 3) go(10, 60);
+  else if (lonely) {                        // senang disentuh lagi setelah lama sendirian
+    static const uint8_t joy[3] = {12, 25, 18};
+    go(joy[random(0, 3)], 70);
+  }
+  else go(26, 50);
+}
+
 void setup() {
-  pinMode(BTN_POKE, INPUT);        // GPIO35: input only, pullup eksternal di board
-  pinMode(BTN_MOOD, INPUT_PULLUP);
+  pinMode(BTN_POWER, INPUT);       // GPIO35: input only, pullup eksternal di board
+  pinMode(BTN_POKE, INPUT_PULLUP);
+  pinMode(BAT_EN, OUTPUT);
+  digitalWrite(BAT_EN, LOW);
 
   tft.init();
   tft.setRotation(ROTATION);
@@ -422,38 +593,49 @@ void setup() {
   centerY = H / 2;
   eyeL_X = centerX - 32;
   eyeR_X = centerX + 32;
+  baseEyeY = centerY + 1;
+  mouthY = centerY + 37;
 
   if (!spr.createSprite(W, H)) {
     tft.setTextColor(FG, BG);
     tft.drawString("Sprite gagal (RAM)", 10, 10, 2);
     while (true) delay(1000);
   }
+
+  prevTop = digitalRead(BTN_POWER);   // supaya klik yang membangunkan tidak terhitung
+  prevBot = digitalRead(BTN_POKE);
+  readBattery(true);
 }
 
 void loop() {
   uint32_t now = millis();
   if (now - lastFrame < 40) return;   // ~25 fps
   lastFrame = now;
+  battShowOn = now < battShowUntil;
 
-  // --- tombol (deteksi tekan) ---
-  bool poke = digitalRead(BTN_POKE);
-  bool moodBtn = digitalRead(BTN_MOOD);
+  bool top = digitalRead(BTN_POWER);
+  bool bot = digitalRead(BTN_POKE);
 
-  if (!poke && prevPoke) {
-    pressCount++;
-    pressDecay = 60;
-    stateTimer = 0;
-    if (pressCount >= 5)      { emojiState = 15; reactionTimer = 80; }
-    else if (pressCount >= 3) { emojiState = 10; reactionTimer = 60; }
-    else                      { emojiState = 26; reactionTimer = 50; }
+  // --- tombol atas: klik = info baterai, dobel klik = power off ---
+  if (!top && prevTop) {
+    if (haveTop && now - lastTopPress < 450) powerOff();
+    lastTopPress = now;
+    haveTop = true;
+    battShowUntil = now + 3000;
+    battShowOn = true;
   }
-  if (!moodBtn && prevMood) {
+  prevTop = top;
+
+  // --- tombol bawah: klik = colek, tahan = ganti mood ---
+  if (!bot && prevBot) { botDownAt = now; longDone = false; }
+  if (!bot && !longDone && now - botDownAt >= 800) {
+    longDone = true;
     currentMood = (currentMood + 1) % NUM_MOODS;
-    moodTimer = 0;
-    stateTimer = 100;   // langsung ganti ekspresi sesuai mood baru
+    moodHold = 1500;                  // mood manual bertahan ±60 detik
+    stateTimer = 100;
   }
-  prevPoke = poke;
-  prevMood = moodBtn;
+  if (bot && !prevBot && !longDone) doPoke();
+  prevBot = bot;
 
   loopCounter++;
   stateTimer++;
@@ -462,26 +644,35 @@ void loop() {
 
   if (pressDecay > 0) pressDecay--; else pressCount = 0;
 
-  // --- mood otomatis ---
-  if (moodTimer > moodDuration) {
-    moodTimer = 0;
-    currentMood = random(0, NUM_MOODS);
+  // --- perhatian turun pelan (±1 tiap 6 detik) ---
+  if (++attnTimer >= 150) { attnTimer = 0; if (attention > 0) attention--; }
+
+  // --- mood mengikuti perhatian (kecuali sedang diatur manual) ---
+  if (moodHold > 0) moodHold--;
+  else if (moodTimer > 150) { moodTimer = 0; currentMood = moodFromAttention(); }
+
+  // --- baterai tiap ±8 detik ---
+  if (loopCounter % 200 == 0) {
+    readBattery(false);
+    if (critCount >= 3) powerOff();   // lindungi baterai
   }
 
-  // --- ganti ekspresi idle ---
+  // --- ganti ekspresi ---
   if (reactionTimer > 0) {
     reactionTimer--;
+  } else if (lowBattery) {
+    if (emojiState != 27) changeState(27);
   } else if (stateTimer > 75) {
     stateTimer = 0;
     int next = emojiState;
     for (int t = 0; t < 4 && next == emojiState; t++) {
       next = POOL[currentMood][random(0, POOL_SIZE)];
     }
-    emojiState = next;
+    changeState(next);
   }
 
   // --- kedip (hanya ekspresi bermata terbuka) ---
-  if (reactionTimer == 0 && canBlink(emojiState)) {
+  if (!trans && reactionTimer == 0 && canBlink(emojiState)) {
     if (blinkPhase == 0 && blinkTimer > blinkCooldown) {
       if (random(1, 5) == 1) { blinkPhase = 1; blinkTimer = 0; }
     } else if (blinkPhase == 1 && blinkTimer > 3) { blinkPhase = 2; blinkTimer = 0; }
@@ -503,5 +694,13 @@ void loop() {
   // --- melirik ---
   if (loopCounter % 100 == 0) lookDir = 1 - lookDir;
 
-  render();
+  // --- transisi: 75% -> 45% -> 20% (ganti ekspresi) -> 45% -> 75% ---
+  int pct = 100;
+  if (trans) {
+    if (transFrame == 2) emojiState = pendingState;
+    pct = TRANS_PCT[transFrame];
+    if (++transFrame >= 5) trans = false;
+  }
+
+  render(pct);
 }
