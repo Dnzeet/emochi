@@ -1,0 +1,59 @@
+name: Build Emochi
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ hashFiles('platformio.ini') }}
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Build
+        run: pio run
+
+      - name: Merge jadi satu .bin (flash di offset 0x0)
+        run: |
+          B=.pio/build/ttgo
+          python ~/.platformio/packages/tool-esptoolpy/esptool.py --chip esp32 merge_bin \
+            -o emochi-ttgo-merged.bin \
+            --flash_mode dio --flash_freq 40m --flash_size 4MB \
+            0x1000 $B/bootloader.bin \
+            0x8000 $B/partitions.bin \
+            0xe000 ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin \
+            0x10000 $B/firmware.bin
+          cp $B/firmware.bin emochi-ttgo-app.bin
+          ls -l *.bin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: emochi-ttgo
+          path: |
+            emochi-ttgo-merged.bin
+            emochi-ttgo-app.bin
+
+      - name: Release (unduh .bin langsung dari HP)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Emochi latest
+          files: |
+            emochi-ttgo-merged.bin
+            emochi-ttgo-app.bin
