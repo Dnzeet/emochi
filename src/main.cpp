@@ -52,8 +52,20 @@ uint32_t lastFrame = 0;
 
 // ================= helper gambar =================
 
-// pil vertikal: persegi + lingkaran atas & bawah
+// skala tinggi mata saat kedip (100 = normal)
+static int blinkPct = 100;
+
+// pil vertikal: persegi + lingkaran atas & bawah (mengecil saat kedip)
 static void tall(int cx, int y1, int y2) {
+  if (blinkPct < 100) {
+    int tot = (y2 - y1) + 34;
+    int nt = tot * blinkPct / 100;
+    if (nt < 34) nt = 34;
+    int cy = (y1 + y2) / 2;
+    int len = nt - 34;
+    y1 = cy - len / 2;
+    y2 = y1 + len;
+  }
   spr.fillRect(cx - 17, y1, 34, y2 - y1, FG);
   spr.fillCircle(cx, y1, 17, FG);
   spr.fillCircle(cx, y2, 17, FG);
@@ -159,17 +171,9 @@ void render() {
   int cx = centerX, L = eyeL_X, R = eyeR_X;
   int p = SINE[sineIndex];                 // -3..3 untuk denyut
 
-  if (blinkPhase == 1 || blinkPhase == 3) {
-    wide(L, by - 4, 18, by + 14);
-    wide(R, by - 4, 18, by + 14);
-    spr.fillRect(cx - 6, my, 12, 5, FG);
+  blinkPct = (blinkPhase == 1 || blinkPhase == 3) ? 85 : (blinkPhase == 2 ? 70 : 100);
 
-  } else if (blinkPhase == 2) {
-    spr.fillRect(L - 17, by, 34, 6, FG);
-    spr.fillRect(R - 17, by, 34, 6, FG);
-    spr.fillRect(cx - 6, my, 12, 5, FG);
-
-  } else switch (emojiState) {
+  switch (emojiState) {
 
     case 0:                                   // normal
       tall(L, by - 22, by + 22);
@@ -296,11 +300,12 @@ void render() {
 
     case 16: {                                // bosan
       int px = lookDir ? 7 : -7;
+      int lid = 18 + (100 - blinkPct) * 20 / 100;
       spr.fillCircle(L, by, 19, FG);
-      spr.fillRect(L - 20, by - 20, 40, 18, BG);
+      spr.fillRect(L - 20, by - 20, 40, lid, BG);
       spr.fillCircle(L + px, by + 8, 6, BG);
       spr.fillCircle(R, by, 19, FG);
-      spr.fillRect(R - 20, by - 20, 40, 18, BG);
+      spr.fillRect(R - 20, by - 20, 40, lid, BG);
       spr.fillCircle(R + px, by + 8, 6, BG);
       spr.fillRect(cx - 10, my + 2, 20, 4, FG);
       break;
