@@ -1,6 +1,6 @@
 // Emochi - emoji ala Dasai Mochi untuk LilyGo T-Display (ESP32, 240x135)
 // Port dari emochi_final2.js (Bruce JS) + ekspresi tambahan
-// Tombol: GPIO35 = colek (1-2x kaget, 3-4x marah, 5x+ pusing) | GPIO0 = ganti mood manual
+// Tombol: GPIO35 = colek (1-2x bingung, 3-4x marah, 5x+ pusing) | GPIO0 = ganti mood manual
 
 #include <Arduino.h>
 #include <TFT_eSPI.h>
@@ -17,9 +17,10 @@ const uint16_t BG = TFT_BLACK;
 const uint16_t FG = TFT_WHITE;
 
 // ---- ID ekspresi ----
-// 0 normal | 1 melirik | 3 kaget | 4 ngantuk | 5 sedih | 7 curiga | 9 tidur | 10 marah | 11 ketawa
+// 0 normal | 1 melirik | 4 ngantuk | 5 sedih | 7 curiga | 9 tidur | 10 marah | 11 ketawa
 // 12 jatuh cinta | 13 kedip sebelah | 14 nangis | 15 pusing | 16 bosan | 17 malu
 // 18 mata bintang | 19 mati (X_X) | 20 takut | 21 mikir | 22 smirk | 23 tenang | 24 cium | 25 berbinar
+// 26 bingung (reaksi colek 1-2x)
 
 const int NUM_MOODS = 6;
 const int POOL_SIZE = 8;
@@ -159,6 +160,17 @@ static void drop(int x, int y) {
   spr.fillTriangle(x - 5, y - 1, x + 5, y - 1, x, y - 13, FG);
 }
 
+// tanda tanya; r = radius lengkung
+static void qmark(int x, int y, int r) {
+  int th = r / 2;
+  if (th < 3) th = 3;
+  ring(x, y, r, th);
+  spr.fillRect(x - r - 1, y + 1, r + 1, r + 2, BG);   // buang kuadran kiri-bawah
+  thickLine(x + r - th / 2, y + 2, x, y + r + 4, th);
+  thickLine(x, y + r + 4, x, y + r + 8, th);
+  spr.fillCircle(x, y + r + 15, th / 2 + 1, FG);
+}
+
 static bool canBlink(int s) {
   return s == 0 || s == 1 || s == 5 || s == 7 || s == 16 || s == 21 || s == 22 || s == 25;
 }
@@ -191,14 +203,15 @@ void render() {
       break;
     }
 
-    case 3:                                   // kaget
-      spr.fillCircle(L, by, 20, FG);
-      spr.fillCircle(L, by, 10, BG);
-      spr.fillCircle(R, by, 20, FG);
-      spr.fillCircle(R, by, 10, BG);
-      spr.fillCircle(cx, my + 4, 8, FG);
-      spr.fillCircle(cx, my + 4, 4, BG);
+    case 26: {                                // bingung (kepala miring + tanda tanya)
+      int t = ((loopCounter / 14) % 2) ? 4 : -4;
+      tall(L + 5, by - 14 - t, by + 10 - t);
+      tall(R + 5, by - 14 + t, by + 10 + t);
+      wavy(cx, my + 4, 20, 3, 3);
+      qmark(cx + 76 + SINE[(loopCounter / 2) % 14], by - 34 + p, 12);
+      if ((loopCounter / 10) % 2 == 0) qmark(cx - 78, by - 24 - p, 8);
       break;
+    }
 
     case 4:                                   // mengantuk
       spr.fillRect(L - 17, by, 34, 26, FG);
@@ -432,7 +445,7 @@ void loop() {
     stateTimer = 0;
     if (pressCount >= 5)      { emojiState = 15; reactionTimer = 80; }
     else if (pressCount >= 3) { emojiState = 10; reactionTimer = 60; }
-    else                      { emojiState = 3;  reactionTimer = 50; }
+    else                      { emojiState = 26; reactionTimer = 50; }
   }
   if (!moodBtn && prevMood) {
     currentMood = (currentMood + 1) % NUM_MOODS;
