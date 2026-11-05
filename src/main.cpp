@@ -21,12 +21,16 @@ TFT_eSprite spr(&tft);
 
 const uint16_t BG = TFT_BLACK;
 const uint16_t FG = TFT_WHITE;
+const uint16_t RED = 0xF800;
+const uint16_t YEL = 0xFFE0;
+const uint16_t GRAY = 0x8C71;
 
 // ---- ID ekspresi ----
 // 0 normal | 1 melirik | 4 ngantuk | 5 sedih | 7 curiga | 9 tidur | 10 marah | 11 ketawa
 // 12 jatuh cinta | 13 kedip sebelah | 14 nangis | 15 pusing | 16 bosan | 17 malu
 // 18 mata bintang | 19 mati (X_X) | 20 takut | 21 mikir | 22 smirk | 23 tenang | 24 cium | 25 berbinar
-// 26 bingung (reaksi colek 1-2x) | 27 lemas (baterai hampir habis)
+// 26 bingung (reaksi colek 1-2x)
+// 27 lemas | 28 minta cas (baterai besar merah) | 29 tunjuk colokan  <- varian baterai hampir habis
 
 const int NUM_MOODS = 6;
 const int POOL_SIZE = 8;
@@ -191,6 +195,24 @@ static void qmark(int x, int y, int r) {
   thickLine(x + r - th / 2, y + 2, x, y + r + 4, th);
   thickLine(x, y + r + 4, x, y + r + 8, th);
   spr.fillCircle(x, y + r + 15, th / 2 + 1, FG);
+}
+
+// ikon baterai ala iOS: outline abu, isi membulat, kepala setengah bulat
+static void batteryIcon(int x, int y, int w, int h, int pct, uint16_t col) {
+  int r = h / 3;
+  int cy = y + h / 2;
+  spr.fillCircle(x + w, cy, h / 5 + 1, GRAY);                 // kepala baterai
+  spr.fillRoundRect(x, y, w, h, r, GRAY);                     // outline
+  spr.fillRoundRect(x + 2, y + 2, w - 4, h - 4, r > 2 ? r - 2 : 1, BG);
+  int iw = ((w - 8) * pct) / 100;
+  if (pct > 0 && iw < 3) iw = 3;
+  if (iw > 0) spr.fillRoundRect(x + 4, y + 4, iw, h - 8, r > 4 ? r - 4 : 1, col);
+}
+
+// petir
+static void bolt(int cx, int cy, int s, uint16_t c) {
+  spr.fillTriangle(cx + s / 4, cy - s, cx - s / 2, cy + s / 8, cx + s / 10, cy + s / 8, c);
+  spr.fillTriangle(cx - s / 10, cy - s / 8, cx + s / 2, cy - s / 8, cx - s / 4, cy + s, c);
 }
 
 static bool canBlink(int s) {
@@ -435,6 +457,35 @@ static void drawFace() {
       arch(cx, my + 12 + w, 10, 4);
       break;
     }
+
+    case 28: {                                // minta cas: mata memelas + baterai merah besar
+      int on = (loopCounter / 12) % 2;
+      tall(L, by - 30, by - 16);
+      tall(R, by - 30, by - 16);
+      thickLine(L - 16, by - 52, L + 14, by - 60, 4);
+      thickLine(R - 14, by - 60, R + 16, by - 52, 4);
+      int bw = 76, bh = 38, bx = cx - bw / 2 - 4, bY = by + 16 + (p > 0 ? 1 : 0);
+      batteryIcon(bx, bY, bw, bh, battValid ? battPct : 5, RED);
+      if (on) bolt(bx + bw / 2, bY + bh / 2, 13, YEL);
+      break;
+    }
+
+    case 29: {                                // tunjuk colokan
+      int dx = -30;
+      int nudge = ((loopCounter / 6) % 2) ? 5 : 0;
+      tall(L + dx, by - 10, by + 12);
+      tall(R + dx, by - 10, by + 12);
+      thickLine(L + dx - 16, by - 36, L + dx + 14, by - 44, 4);
+      thickLine(R + dx - 14, by - 44, R + dx + 16, by - 36, 4);
+      arch(cx + dx, my + 12, 10, 4);
+      int px = cx + 50 - nudge, py = by - 4;
+      spr.fillRoundRect(px, py, 30, 24, 6, FG);              // badan colokan
+      spr.fillRect(px - 9, py + 4, 9, 4, FG);                // kaki
+      spr.fillRect(px - 9, py + 16, 9, 4, FG);
+      thickLine(px + 30, py + 12, px + 52, py + 12, 5);      // kabel
+      if ((loopCounter / 10) % 2 == 0) bolt(px + 15, py - 16, 9, YEL);
+      break;
+    }
   }
 
 }
@@ -458,19 +509,17 @@ static void squashRows(int c, int pct) {
 }
 
 static void drawBatteryOverlay(bool withText) {
-  int x = W - 40, y = 5;
-  spr.fillRect(x, y, 30, 14, FG);
-  spr.fillRect(x + 2, y + 2, 26, 10, BG);
-  spr.fillRect(x + 30, y + 4, 3, 6, FG);
-  int w = battValid ? (24 * battPct) / 100 : 0;
-  if (w > 0) spr.fillRect(x + 3, y + 3, w, 8, FG);
+  bool red = battValid && battPct <= 20;
+  uint16_t col = red ? RED : FG;
+  int x = W - 48, y = 5;
+  batteryIcon(x, y, 38, 18, battValid ? battPct : 0, col);
   if (withText) {
     char b[8];
     if (battValid) snprintf(b, sizeof b, "%d%%", battPct);
     else snprintf(b, sizeof b, "--");
-    spr.setTextColor(FG, BG);
+    spr.setTextColor(col, BG);
     spr.setTextSize(2);
-    spr.drawString(b, x - 4 - (int)strlen(b) * 12, y - 1, 1);
+    spr.drawString(b, x - 6 - (int)strlen(b) * 12, y + 1, 1);
   }
 }
 
@@ -478,7 +527,7 @@ void render(int pct) {
   drawFace();
   if (pct < 100) squashRows(baseEyeY, pct);
   if (battShowOn) drawBatteryOverlay(true);
-  else if (lowBattery && (loopCounter / 12) % 2 == 0) drawBatteryOverlay(false);
+  else if (lowBattery && emojiState != 28 && (loopCounter / 12) % 2 == 0) drawBatteryOverlay(false);
   spr.pushSprite(0, 0);
 }
 
@@ -661,7 +710,17 @@ void loop() {
   if (reactionTimer > 0) {
     reactionTimer--;
   } else if (lowBattery) {
-    if (emojiState != 27) changeState(27);
+    static const uint8_t LOW_POOL[6] = {27, 28, 29, 28, 27, 29};
+    bool isLow = emojiState == 27 || emojiState == 28 || emojiState == 29;
+    if (!isLow) {
+      stateTimer = 0;
+      changeState(27);
+    } else if (stateTimer > 100) {
+      stateTimer = 0;
+      int next = emojiState;
+      for (int t = 0; t < 4 && next == emojiState; t++) next = LOW_POOL[random(0, 6)];
+      changeState(next);
+    }
   } else if (stateTimer > 75) {
     stateTimer = 0;
     int next = emojiState;
