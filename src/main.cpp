@@ -1,7 +1,8 @@
 // Emochi - emoji ala Dasai Mochi untuk LilyGo T-Display (ESP32, 240x135)
 // Port dari emochi_final2.js (Bruce JS) + ekspresi tambahan
-// Tombol atas (GPIO35): klik = info baterai | dobel klik = power off | klik lagi = nyala
+// Tombol atas (GPIO35): klik = info baterai | dobel klik = power off | klik lagi = nyala | tahan = atur kecerahan
 // Tombol bawah (GPIO0): klik = colek (1-2x bingung/senang, 3-4x marah, 5x+ pusing) | tahan = ganti mood
+// Mode kecerahan: tombol atas = terang (+), tombol bawah = redup (-), otomatis tersimpan
 
 #include <Arduino.h>
 #include <TFT_eSPI.h>
@@ -9,9 +10,11 @@
 #include <string.h>
 #include <stdio.h>
 #include <esp_sleep.h>
+#include <Preferences.h>
 
 #define BTN_POWER 35   // tombol atas
 #define BTN_POKE  0    // tombol bawah
+#define BL_CH      0   // kanal PWM backlight
 #define BAT_PIN   34   // ADC baterai (pembagi 2:1)
 #define BAT_EN    14   // enable pengukuran baterai (diabaikan kalau tidak terpasang di board)
 #define ROTATION 1   // ubah ke 3 kalau tampilan terbalik
@@ -66,6 +69,12 @@ int attention = 75, attnTimer = 0, moodHold = 0;
 bool prevTop = true, prevBot = true;
 uint32_t lastTopPress = 0, botDownAt = 0;
 bool haveTop = false, longDone = false;
+
+// kecerahan (1..10 = 10%..100%), tersimpan di NVS
+Preferences prefs;
+uint8_t brightness = 10;
+bool setMode = false, brightDirty = false, topLongDone = false;
+uint32_t setUntil = 0, topDownAt = 0;
 
 // baterai
 int vbat = 0, battPct = 0, critCount = 0;
@@ -523,10 +532,37 @@ static void drawBatteryOverlay(bool withText) {
   }
 }
 
+static void applyBrightness() {
+  int pct = brightness * 10;
+  int duty = (255 * pct * pct) / 10000;      // kurva kuadrat: terasa lebih merata di mata
+  if (duty < 6) duty = 6;
+  ledcWrite(BL_CH, duty);
+}
+
+static void drawBrightnessOverlay() {
+  int px = 24, py = 26, pw = W - 48, ph = 84;
+  spr.fillRoundRect(px, py, pw, ph, 10, GRAY);
+  spr.fillRoundRect(px + 2, py + 2, pw - 4, ph - 4, 9, BG);
+  char t[24];
+  snprintf(t, sizeof t, "Kecerahan %d%%", brightness * 10);
+  spr.setTextColor(FG, BG);
+  spr.setTextSize(2);
+  spr.drawString(t, px + (pw - (int)strlen(t) * 12) / 2, py + 10, 1);
+  int segW = 14, gap = 3, total = 10 * segW + 9 * gap;
+  int sx = px + (pw - total) / 2, sy = py + 34;
+  for (int i = 0; i < 10; i++) {
+    spr.fillRoundRect(sx + i * (segW + gap), sy, segW, 16, 3, i < brightness ? FG : (uint16_t)0x2104);
+  }
+  spr.setTextSize(1);
+  const char* hint = "ATAS: terang    BAWAH: redup";
+  spr.drawString(hint, px + (pw - (int)strlen(hint) * 6) / 2, py + 62, 1);
+}
+
 void render(int pct) {
   drawFace();
   if (pct < 100) squashRows(baseEyeY, pct);
-  if (battShowOn) drawBatteryOverlay(true);
+  if (setMode) drawBrightnessOverlay();
+  else if (battShowOn) drawBatteryOverlay(true);
   else if (lowBattery && emojiState != 28 && (loopCounter / 12) % 2 == 0) drawBatteryOverlay(false);
   spr.pushSprite(0, 0);
 }
@@ -577,6 +613,9 @@ static void powerOff() {
   }
   while (digitalRead(BTN_POWER) == LOW) delay(10);   // tunggu tombol dilepas
   delay(80);
+  ledcWrite(BL_CH, 0);
+  ledcDetachPin(TFT_BL);
+  pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, LOW);
   tft.writecommand(TFT_DISPOFF);
   tft.writecommand(TFT_SLPIN);
@@ -636,6 +675,13 @@ void setup() {
   tft.setRotation(ROTATION);
   tft.fillScreen(BG);
 
+  prefs.begin("emochi", false);
+  int b = prefs.getUChar("br", 10);
+  brightness = (b < 1) ? 1 : (b > 10 ? 10 : b);
+  ledcSetup(BL_CH, 5000, 8);
+  ledcAttachPin(TFT_BL, BL_CH);
+  applyBrightness();
+
   W = tft.width();
   H = tft.height();
   centerX = W / 2;
@@ -665,19 +711,45 @@ void loop() {
   bool top = digitalRead(BTN_POWER);
   bool bot = digitalRead(BTN_POKE);
 
-  // --- tombol atas: klik = info baterai, dobel klik = power off ---
+  // --- tombol atas: klik = info baterai | dobel klik = power off | tahan = mode kecerahan ---
   if (!top && prevTop) {
-    if (haveTop && now - lastTopPress < 450) powerOff();
-    lastTopPress = now;
-    haveTop = true;
-    battShowUntil = now + 3000;
-    battShowOn = true;
+    topDownAt = now;
+    topLongDone = false;
+    if (setMode) {                    // di mode kecerahan: terang (+)
+      if (brightness < 10) brightness++;
+      applyBrightness();
+      brightDirty = true;
+      setUntil = now + 4000;
+    } else {
+      if (haveTop && now - lastTopPress < 450) powerOff();
+      lastTopPress = now;
+      haveTop = true;
+      battShowUntil = now + 3000;
+      battShowOn = true;
+    }
+  }
+  if (!top && !topLongDone && !setMode && now - topDownAt >= 800) {
+    topLongDone = true;               // tahan tombol atas: masuk mode kecerahan
+    setMode = true;
+    setUntil = now + 4000;
+    battShowUntil = 0;
+    battShowOn = false;
   }
   prevTop = top;
 
-  // --- tombol bawah: klik = colek, tahan = ganti mood ---
-  if (!bot && prevBot) { botDownAt = now; longDone = false; }
-  if (!bot && !longDone && now - botDownAt >= 800) {
+  // --- tombol bawah: klik = colek | tahan = ganti mood | (mode kecerahan: redup) ---
+  if (!bot && prevBot) {
+    botDownAt = now;
+    longDone = false;
+    if (setMode) {
+      if (brightness > 1) brightness--;
+      applyBrightness();
+      brightDirty = true;
+      setUntil = now + 4000;
+      longDone = true;                // cegah colek saat dilepas
+    }
+  }
+  if (!setMode && !bot && !longDone && now - botDownAt >= 800) {
     longDone = true;
     currentMood = (currentMood + 1) % NUM_MOODS;
     moodHold = 1500;                  // mood manual bertahan ±60 detik
@@ -685,6 +757,12 @@ void loop() {
   }
   if (bot && !prevBot && !longDone) doPoke();
   prevBot = bot;
+
+  // --- keluar mode kecerahan setelah 4 detik tanpa sentuhan, simpan ---
+  if (setMode && now > setUntil) {
+    setMode = false;
+    if (brightDirty) { prefs.putUChar("br", brightness); brightDirty = false; }
+  }
 
   loopCounter++;
   stateTimer++;
